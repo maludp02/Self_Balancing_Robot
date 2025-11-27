@@ -4,13 +4,13 @@
 - Maria Luisa
 - Ana carolina
 
-## --- Project Overview ---
+## 📄 Project Overview 
 
 This project was developed as a practical application for the **Control Systems II** course. It implements a classic **Inverted Pendulum** system, a fundamental benchmark in control theory to demonstrate the stability of inherently unstable systems.
 
 The main objective is to keep a two-wheeled robot upright using a closed-loop control system. By reading the tilt angle from the MPU6050 sensor (using sensor fusion), the Arduino Mega calculates the necessary correction via a **PID (Proportional-Integral-Derivative) algorithm** and adjusts the DC motors' speed in real-time to maintain vertical equilibrium.
 
-## --- KEY FEATURES ---
+##  🔑 KEY FEATURES 
 The core logic of this code uses:
 
 1.  **MPU6050 DMP**: Angle calculation is performed inside the sensor chip.
@@ -19,7 +19,7 @@ The core logic of this code uses:
 4.  **Outlier Filter**: Rejects spurious readings or excessive sensor noise.
 5.  **I2C Watchdog**: Prevents microcontroller freezes if the sensor connection fails momentarily.
 
-## --- Required Hardware ---
+## ⚙️ Required Hardware 
 
 - **Microcontroller**: Arduino Mega 2560
 - **Sensor**: MPU6050 (Accelerometer + Gyroscope)
@@ -27,7 +27,7 @@ The core logic of this code uses:
 - **Motors**: 2x DC Motors with Gearbox
 - **Power Supply**: Li-Ion Battery (e.g., 2x 18650 or 3S LiPo)
 
-## --- Connections (Arduino Mega) ---
+## 🔌 Connections (Arduino Mega) 
 
 ### MPU6050
 | MPU6050 Pin | Arduino Mega Pin | Note |
@@ -48,7 +48,7 @@ The core logic of this code uses:
 | ENA/ENB   | 5V (Jumper)      | Enable Motors |
 
 
-## Calibration
+## 📍Calibration
 
 To achieve stability, the MPU6050 must be calibrated to find its "natural zero" offsets.
 
