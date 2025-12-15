@@ -1,286 +1,258 @@
-#include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
-#include "Wire.h"
+#include <Arduino.h>
+#include <Wire.h>
 
-// ================================================================
-// 1. HARDWARE PINOUT (#define)
-// ================================================================
+#define MPU 0X68
 
-#define MOTOR_LEFT_IN1  7
-#define MOTOR_LEFT_IN2  6
-#define MOTOR_RIGHT_IN3 5
+// --- PINOUTS  ---
+#define MOTOR_LEFT_IN1 7  
+#define MOTOR_LEFT_IN2 6  
+#define MOTOR_RIGHT_IN3 5  
 #define MOTOR_RIGHT_IN4 4
-#define MPU_INT_PIN     2
 
-// ================================================================
-// 2. PID CONTROL VARIABLES
-// ================================================================
+// --- CONSTANTS ---
 
-// Tuning Parameters (Gains)
-double pid_kp = 1.15;
-double pid_ki = 0.0015;
-double pid_kd = 0.002;
+// Calibration Offsets
+constexpr int offset_accelX = -338;
+constexpr int offset_accelY = -479;
+constexpr int offset_accelZ = 1462;
+constexpr int offset_gyroX = 131;
 
-// Configuration and Limits
-double pid_setPoint = 0.0;
-double pid_limitIntegralMax = 20.0;  // Anti-windup max
-double pid_limitIntegralMin = -20.0; // Anti-windup min
-double pid_maxOutput = 255.0;        // PWM limit
+// Control Variables
+constexpr uint8_t min_pwm = 64;
+constexpr int16_t max_pwm = 245;
 
-// System State (Memory)
-double pid_error = 0;
-double pid_lastError = 0;
-double pid_integral = 0;
-double pid_derivative = 0;
-double pid_output = 0;
+//PID Tuning
+constexpr float Kp = 10;
+constexpr float Ki = 1;
+constexpr float Kd = 0.1; 
 
-// Timing
-unsigned long pid_lastProcessTime = 0;
+// PID Setpoint
+constexpr float setpoint = 0.0;
 
-// ================================================================
-// 3. MPU6050 SENSOR VARIABLES
-// ================================================================
+// --- GLOBAL VARIABLES m--
+// Sensor Variables (Raw Data)
+int16_t raw_accelX;
+int16_t raw_accelY;
+int16_t raw_accelZ;
+int16_t raw_gyroX;
 
-MPU6050 mpu;
+// Angles
+float accel_angle = 0;
+float filtered_angle = 0;
 
-// Filter Configuration
-const float FILTER_ALPHA = 0.7;   
-const float MAX_ANGLE_CHANGE = 30.0;
+// PID Variables
+float proportional_error = 0;
+float last_proportional_error = 0;
+float integral_error = 0;
+float derivative_error = 0;
+float pid_output = 0;
 
-// MPU Control/Status
-bool dmpReady = false;  
-uint8_t mpuIntStatus;   
-uint8_t devStatus;     
-uint16_t packetSize;    
-uint16_t fifoCount;    
-uint8_t fifoBuffer[64]; 
+// Time Management
+unsigned long previous_time = 0;
+float delta_time = 0;
 
-// Orientation/Motion
-Quaternion q;           // [w, x, y, z]   
-VectorFloat gravity;    // [x, y, z]            
-float ypr[3];           // [yaw, pitch, roll]   
+// Teleplot Counter
+uint8_t teleplot_counter = 0;
 
-// Processed Angle
-float currentAngle = 0.0;
-float lastValidAngle = 0.0;
-unsigned int outlierCount = 0;
+// --- FUNCTION PROTOTYPES ---
+void initializedMPU();
+void accelerometerReadings();
+void gyroscopeReadings();
+float calculateAccelAngle(float ax, float ay, float az);
+void moveMotors(float control_signal);
 
-// Interrupt Flag
-volatile bool mpuInterrupt = false;
-
-// ================================================================
-// INTERRUPT ROUTINE
-// ================================================================
-
-void dmpDataReady() 
+void setup()
 {
-    mpuInterrupt = true;
-}
-
-// ================================================================
-// FUNCTION PROTOTYPES
-// ================================================================
-
-void initMPU();
-void controlMotors(double output);
-
-// ================================================================
-// SETUP
-// ================================================================
-
-void setup() 
-{
-    // 1. Initialize Communication
-    Wire.begin();
-    Wire.setClock(400000); 
     Serial.begin(115200);
 
-    // 2. Initialize Motor Pins
+    // Initialize PINS
     pinMode(MOTOR_LEFT_IN1, OUTPUT);
     pinMode(MOTOR_LEFT_IN2, OUTPUT);
     pinMode(MOTOR_RIGHT_IN3, OUTPUT);
     pinMode(MOTOR_RIGHT_IN4, OUTPUT);
 
-    // 3. Initialize MPU6050
-    initMPU();
+    moveMotors(0);
+    initializedMPU();
 
-    // 4. Initialize PID Timer
-    pid_lastProcessTime = millis();
+    // Reset PID variables for safety
+    pid_output = 0;
+    integral_error = 0;
+    proportional_error = 0;
+    last_proportional_error = 0;
+    filtered_angle = 0;
+    accel_angle = 0;
+
+
+    // --- INITIAL STABILIZATION ---
+    accelerometerReadings();
+
+    float start_accelX = raw_accelX + offset_accelX;
+    float start_accelY = raw_accelY + offset_accelY;
+    float start_accelZ = raw_accelZ + offset_accelZ;
+
+    filtered_angle = calculateAccelAngle(start_accelX, start_accelY, start_accelZ);
+
+    previous_time = micros();
 }
 
-// ================================================================
-// MAIN LOOP
-// ================================================================
-
-void loop() 
+void loop()
 {
-    // If MPU failed or no new data, return
-    if (!dmpReady || !mpuInterrupt) return;
+    // --- 1. SENSOR READINGS ---
+    accelerometerReadings();
+    gyroscopeReadings();
 
-    // Reset interrupt flag
-    mpuInterrupt = false;
+    // Apply Offsets
+    float real_accelX = raw_accelX + offset_accelX;
+    float real_accelY = raw_accelY + offset_accelY;
+    float real_accelZ = raw_accelZ + offset_accelZ;
+    float real_gyroX = raw_gyroX + offset_gyroX;
 
-    // --- MPU READ SEQUENCE ---
-  
-    mpuIntStatus = mpu.getIntStatus();
-    fifoCount = mpu.getFIFOCount();
 
-    // Check for FIFO Overflow
-  
-    if ((mpuIntStatus & 0x10) || fifoCount == 1024) 
+    // --- 2. ANGLE CALCULATIONS (Complementary Filter) ---
+    // Delta Time Calculation
+    unsigned long current_time = micros();
+    delta_time = (current_time - previous_time) / 1000000.0;
+    previous_time = current_time;
+
+
+    accel_angle = calculateAccelAngle(real_accelX, real_accelY, real_accelZ);
+    float gyro_rateX = real_gyroX / 131.0;
+
+    // Ensure delta_time is positive and non-zero
+    if (delta_time <= 0) return; 
+
+    // Filtered Angle Update
+    filtered_angle = 0.98 * (filtered_angle + gyro_rateX*delta_time ) + 0.01 * accel_angle;
+
+    // --- 3. PID CONTROL ---
+    // This line calculates the error between the desired setpoint and the current angle
+    // Allowed the roobt have a balance not only at 0 degrees but also at other angles if needed
+    proportional_error = filtered_angle - setpoint;
+
+
+    // Integral with safety check
+    // After 40 degrees the robots falls too fast, so we avoid integral wind-up
+    if (abs(filtered_angle) < 40) 
     {
-        mpu.resetFIFO();
-        Serial.println(F("FIFO Overflow!"));
-    }
-      
-    // Check for DMP Data Ready
-    else if (mpuIntStatus & 0x02) 
-    {
-        // Wait for correct packet size
-        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-
-        // Read packet
-        mpu.getFIFOBytes(fifoBuffer, packetSize);
-        fifoCount -= packetSize;
-
-        // Extract Data
-        mpu.dmpGetQuaternion(&q, fifoBuffer);
-        mpu.dmpGetGravity(&gravity, &q);
-        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-
-        // Convert Radians to Degrees
-        float rawAngle = ypr[1] * 180 / M_PI; 
-
-        // --- OUTLIER FILTERING ---
-        float deltaAngle = abs(rawAngle - lastValidAngle);
-
-        if (deltaAngle < MAX_ANGLE_CHANGE || outlierCount > 5) 
-        {
-            // Valid reading
-            lastValidAngle = rawAngle;
-            outlierCount = 0;
-            
-            // Low-Pass Filter
-            currentAngle = (FILTER_ALPHA * currentAngle) + ((1.0 - FILTER_ALPHA) * rawAngle);
-        } else 
-        {
-            // Invalid reading (noise spike)
-            outlierCount++;
-        }
-
-        // --- PID CALCULATION ---
-        unsigned long now = millis();
-        double dt = (now - pid_lastProcessTime) / 1000.0; // Seconds
-
-        // Safety check for dt
-        if(dt <= 0 || dt > 0.5) dt = 0.01; 
-        pid_lastProcessTime = now;
-
-        // 1. Error
-        pid_error = pid_setPoint - currentAngle;
-
-        // 2. Integral (with Anti-Windup)
-        pid_integral += (pid_ki * pid_error * dt);
-        
-        if (pid_integral > pid_limitIntegralMax) pid_integral = pid_limitIntegralMax;
-        if (pid_integral < pid_limitIntegralMin) pid_integral = pid_limitIntegralMin;
-
-        // 3. Derivative
-        pid_derivative = (pid_error - pid_lastError) / dt;
-
-        // 4. Output
-        double P = pid_kp * pid_error;
-        double I = pid_integral;
-        double D = pid_kd * pid_derivative;
-
-        pid_output = P + I + D;
-        pid_lastError = pid_error;
-
-        // --- MOTOR CONTROL ---
-        controlMotors(pid_output);
-    }
-}
-
-// ================================================================
-// HELPER FUNCTIONS
-// ================================================================
-
-void initMPU() 
-{
-    Serial.println(F("Initializing I2C..."));
-    mpu.initialize();
-    
-    Serial.println(F("Testing MPU connection..."));
-  
-    if(!mpu.testConnection()) 
-    {
-        Serial.println(F("MPU6050 connection failed!"));
-        while(1);
-    }
-
-    Serial.println(F("Initializing DMP..."));
-    devStatus = mpu.dmpInitialize();
-
-    // --------------------------------------------------------
-    // IMPORTANT: INSERT YOUR CALIBRATED OFFSETS HERE
-    // --------------------------------------------------------
-  
-    mpu.setXAccelOffset(-338);
-    mpu.setYAccelOffset(-479);
-    mpu.setZAccelOffset(1462);
-    mpu.setXGyroOffset(131);
-    mpu.setYGyroOffset(6);
-    mpu.setZGyroOffset(-18);
-  
-    // --------------------------------------------------------
-
-    if (devStatus == 0) 
-    {
-        mpu.setDMPEnabled(true);
-        attachInterrupt(digitalPinToInterrupt(MPU_INT_PIN), dmpDataReady, RISING);
-        mpuIntStatus = mpu.getIntStatus();
-        dmpReady = true;
-        packetSize = mpu.dmpGetFIFOPacketSize();
-        Serial.println(F("DMP Ready!"));
+        integral_error += (proportional_error + last_proportional_error)* delta_time/ 2.0;
     } else 
     {
-        Serial.print(F("DMP Initialization failed (code "));
-        Serial.print(devStatus);
-        Serial.println(F(")"));
+        integral_error = 0; 
     }
+
+    // Prevents the accumulated error from increasing indefinitely (Windup) if the robot stalls (stuck)
+    integral_error = constrain(integral_error, -max_pwm, max_pwm);
+
+    // Derivative
+    //Gyro rate is already the derivative of angle
+    derivative_error = gyro_rateX;
+    //derivative_error = (proportional_error - last_proportional_error ) / delta_time;
+
+    last_proportional_error = proportional_error;
+
+    // PID Output
+    pid_output = (Kp * proportional_error) + (Ki * integral_error) + (Kd*derivative_error);
+
+    // --- 4. MOTOR ACTUATION ---
+    // Safety check: If angle too large, stop motors to avoid damage
+    if (abs(filtered_angle) > 45) 
+    {
+        moveMotors(0);
+    } else 
+    {
+        moveMotors(pid_output);
+    }
+
+    // --- 5. TELEMETRY ---
+
+    teleplot_counter++;
+
+    if (teleplot_counter >= 40) 
+    {
+        Serial.print(">filtered angle:"); Serial.println(filtered_angle); 
+        Serial.print(">PWM:"); Serial.println(pid_output); 
+        // Showing current PID values so you can track them
+        Serial.print(">P_error:"); Serial.println(proportional_error);
+        Serial.print(">I_error:"); Serial.println(integral_error);
+        Serial.print(">D_error:"); Serial.println(derivative_error);
+        Serial.print(">DeltaTime:"); Serial.println(delta_time, 6);
+        teleplot_counter = 0;
+    }
+
 }
 
-void controlMotors(double output) 
+// --- FUNCTION DEFINITIONS ---
+
+void initializedMPU() 
 {
-    // Limit PWM
-    if (output > pid_maxOutput) output = pid_maxOutput;
-    if (output < -pid_maxOutput) output = -pid_maxOutput;
+    Wire.begin();
+    Wire.setClock(400000); 
+    Wire.setWireTimeout(3000, true);
+    Wire.beginTransmission(MPU);
+    Wire.write(0x6B); 
+    Wire.write(0);     
+    Wire.endTransmission(true);
+}
 
-    int pwmVal = abs((int)output);
+void accelerometerReadings()
+{
+    Wire.beginTransmission(MPU);
+    Wire.write(0x3B); 
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU, 6, true); 
 
-    // Deadzone check (optional)
-    // if (pwmVal < 30 && pwmVal > 0) pwmVal = 30;
+    raw_accelX = Wire.read() << 8 | Wire.read(); 
+    raw_accelY = Wire.read() << 8 | Wire.read(); 
+    raw_accelZ = Wire.read() << 8 | Wire.read(); 
+}
 
-    if (output > 0)
+void gyroscopeReadings()
+{
+    Wire.beginTransmission(MPU);
+    Wire.write(0x43); 
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU, 2, true); 
+    raw_gyroX = Wire.read() << 8 | Wire.read(); 
+}
+
+float calculateAccelAngle(float accelX, float accelY, float accelZ)
+{
+    float denominator = sqrt((accelY * accelY) + (accelZ * accelZ));
+    float angle_rad = atan2(accelX, denominator);
+
+    return angle_rad * (180.0 / PI);
+}
+
+void moveMotors(float control_signal)
+{
+    uint16_t motor_power = abs(control_signal);
+
+    if (motor_power > 0) motor_power += min_pwm; 
+
+
+    int pwm_out = constrain(motor_power, 0, max_pwm);
+
+    if (control_signal > 0) 
     {
-        // Forward
-        analogWrite(MOTOR_LEFT_IN1, pwmVal);
-        analogWrite(MOTOR_LEFT_IN2, 0);
-        analogWrite(MOTOR_RIGHT_IN3, pwmVal);
-        analogWrite(MOTOR_RIGHT_IN4, 0);
-    } else if (output < 0) 
-    {
-        // Backward
         analogWrite(MOTOR_LEFT_IN1, 0);
-        analogWrite(MOTOR_LEFT_IN2, pwmVal);
-        analogWrite(MOTOR_RIGHT_IN3, 0);
-        analogWrite(MOTOR_RIGHT_IN4, pwmVal);
-    } else 
+        analogWrite(MOTOR_LEFT_IN2, pwm_out);
+        analogWrite(MOTOR_RIGHT_IN3, pwm_out);
+        analogWrite(MOTOR_RIGHT_IN4, 0);
+
+    } 
+    else if (control_signal < -0) 
     {
-        // Stop
-        digitalWrite(MOTOR_LEFT_IN1, LOW);
-        digitalWrite(MOTOR_LEFT_IN2, LOW);
-        digitalWrite(MOTOR_RIGHT_IN3, LOW);
-        digitalWrite(MOTOR_RIGHT_IN4, LOW);
+        analogWrite(MOTOR_LEFT_IN1, pwm_out);
+        analogWrite(MOTOR_LEFT_IN2, 0);
+        analogWrite(MOTOR_RIGHT_IN3, 0);
+        analogWrite(MOTOR_RIGHT_IN4, pwm_out);
+    } 
+    else 
+    {
+        analogWrite(MOTOR_LEFT_IN1, 0);
+        analogWrite(MOTOR_LEFT_IN2, 0);
+        analogWrite(MOTOR_RIGHT_IN3, 0);
+        analogWrite(MOTOR_RIGHT_IN4, 0);
     }
 }
+
